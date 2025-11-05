@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/big"
@@ -9,9 +10,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
-var (
-	MagicBytes = []byte{0xCA, 0xFE, 0xDA, 0x7A}
-)
+// MagicBytes is a unique identifier for custom transactions
+var MagicBytes = []byte{0xCA, 0xFE, 0xDA, 0x7A}
 
 type CustomTransaction struct {
 	*types.Transaction
@@ -45,24 +45,29 @@ func NewCustomTransaction(
 }
 
 func EncodeCustomData(standardData, customData []byte) []byte {
-	result := make([]byte, 0, len(MagicBytes)+4+len(customData)+len(standardData))
+	totalSize := len(MagicBytes) + 4 + len(customData) + len(standardData)
+	result := make([]byte, 0, totalSize)
+
 	result = append(result, MagicBytes...)
 
 	lengthBytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(lengthBytes, uint32(len(customData)))
 	result = append(result, lengthBytes...)
+
 	result = append(result, customData...)
+
 	result = append(result, standardData...)
 
 	return result
 }
 
 func DecodeCustomData(encodedData []byte) (customData, standardData []byte, err error) {
-	if len(encodedData) < len(MagicBytes)+4 {
+	minLength := len(MagicBytes) + 4
+	if len(encodedData) < minLength {
 		return nil, encodedData, nil
 	}
 
-	if string(encodedData[:len(MagicBytes)]) != string(MagicBytes) {
+	if !bytes.Equal(encodedData[:len(MagicBytes)], MagicBytes) {
 		return nil, encodedData, nil
 	}
 
@@ -70,10 +75,14 @@ func DecodeCustomData(encodedData []byte) (customData, standardData []byte, err 
 	offset := len(MagicBytes) + 4
 
 	if uint32(len(encodedData)) < uint32(offset)+length {
-		return nil, nil, fmt.Errorf("invalid custom data encoding")
+		return nil, nil, fmt.Errorf(
+			"invalid custom data encoding: declared length %d exceeds available data",
+			length,
+		)
 	}
 
 	customData = encodedData[offset : offset+int(length)]
+
 	standardData = encodedData[offset+int(length):]
 
 	return customData, standardData, nil
@@ -89,5 +98,5 @@ func IsCustomTransaction(tx *types.Transaction) bool {
 	if len(data) < len(MagicBytes) {
 		return false
 	}
-	return string(data[:len(MagicBytes)]) == string(MagicBytes)
+	return bytes.Equal(data[:len(MagicBytes)], MagicBytes)
 }
