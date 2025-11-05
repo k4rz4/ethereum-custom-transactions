@@ -35,20 +35,24 @@ func (t *Tree) build() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// Start with leaf layer
 	currentLevel := make([]common.Hash, len(t.leaves))
 	copy(currentLevel, t.leaves)
 	t.layers = append(t.layers, currentLevel)
 
-	// Build tree bottom-up, cache each layer
+	// Build tree bottom-up, caching each layer
 	for len(currentLevel) > 1 {
 		nextLevel := make([]common.Hash, 0, (len(currentLevel)+1)/2)
 
+		// Combine pairs of nodes
 		for i := 0; i < len(currentLevel); i += 2 {
 			if i+1 < len(currentLevel) {
+				// Hash pair of nodes together
 				combined := append(currentLevel[i].Bytes(), currentLevel[i+1].Bytes()...)
 				parentHash := crypto.Keccak256Hash(combined)
 				nextLevel = append(nextLevel, parentHash)
 			} else {
+				// Odd number of nodes, promote the last one
 				nextLevel = append(nextLevel, currentLevel[i])
 			}
 		}
@@ -57,7 +61,10 @@ func (t *Tree) build() {
 		currentLevel = nextLevel
 	}
 
-	t.root = currentLevel[0]
+	// The last node is the root
+	if len(currentLevel) > 0 {
+		t.root = currentLevel[0]
+	}
 }
 
 func (t *Tree) GenerateProof(index uint) []common.Hash {
@@ -71,14 +78,17 @@ func (t *Tree) GenerateProof(index uint) []common.Hash {
 	proof := make([]common.Hash, 0, len(t.layers)-1)
 	currentIndex := index
 
+	// Collect sibling hash at each level
 	for level := 0; level < len(t.layers)-1; level++ {
 		layer := t.layers[level]
+
 		siblingIndex := currentIndex ^ 1
 
 		if siblingIndex < uint(len(layer)) {
 			proof = append(proof, layer[siblingIndex])
 		}
 
+		// Move to parent index
 		currentIndex >>= 1
 	}
 
@@ -104,6 +114,7 @@ func (t *Tree) VerifyProof(leaf common.Hash, index uint, proof []common.Hash) bo
 		currentIndex >>= 1
 	}
 
+	// If we reconstructed the same root, proof is valid
 	return currentHash == root
 }
 
