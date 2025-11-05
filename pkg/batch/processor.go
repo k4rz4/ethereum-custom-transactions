@@ -15,14 +15,17 @@ import (
 
 // Processor handles high-throughput parallel processing
 type Processor struct {
-	manager *transaction.Manager
-	workers int
-	queue   chan *Request
-	results chan *Result
-	wg      sync.WaitGroup
-	ctx     context.Context
-	cancel  context.CancelFunc
-	metrics *Metrics
+	manager   *transaction.Manager
+	workers   int
+	queue     chan *Request
+	results   chan *Result
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	metrics   *Metrics
+	closeOnce sync.Once
+	closed    bool
+	mu        sync.RWMutex
 }
 
 type Request struct {
@@ -50,6 +53,13 @@ type Metrics struct {
 }
 
 func NewProcessor(manager *transaction.Manager, workers int, queueSize int) *Processor {
+	if workers < 1 {
+		workers = 1
+	}
+	if queueSize < 1 {
+		queueSize = 100
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Processor{
@@ -60,6 +70,7 @@ func NewProcessor(manager *transaction.Manager, workers int, queueSize int) *Pro
 		ctx:     ctx,
 		cancel:  cancel,
 		metrics: &Metrics{},
+		closed:  false,
 	}
 
 	for i := 0; i < workers; i++ {
@@ -77,8 +88,8 @@ func (p *Processor) worker(id int) {
 		select {
 		case <-p.ctx.Done():
 			return
-		case req := <-p.queue:
-			if req == nil {
+		case req, ok := <-p.queue:
+			if !ok {
 				return
 			}
 			p.processRequest(req)
@@ -89,8 +100,10 @@ func (p *Processor) worker(id int) {
 func (p *Processor) processRequest(req *Request) {
 	startTime := time.Now()
 
-	tx, err := p.manager.Send(req.To, req.Value, req.CustomData, req.Data)
+	ctx, cancel := context.WithTimeout(p.ctx, 30*time.Second)
+	defer cancel()
 
+	tx, err := p.manager.SendWithContext(ctx, req.To, req.Value, req.CustomData, req.Data)
 	duration := time.Since(startTime)
 
 	result := &Result{
@@ -105,10 +118,23 @@ func (p *Processor) processRequest(req *Request) {
 	select {
 	case p.results <- result:
 	case <-p.ctx.Done():
+	default:
+		// Results channel full, log but don't block
 	}
 }
 
 func (p *Processor) Submit(req *Request) error {
+	p.mu.RLock()
+	if p.closed {
+		p.mu.RUnlock()
+		return fmt.Errorf("processor is closed")
+	}
+	p.mu.RUnlock()
+
+	if req.Value == nil {
+		req.Value = big.NewInt(0)
+	}
+
 	req.Timestamp = time.Now()
 	p.metrics.IncrementQueued()
 
@@ -116,9 +142,9 @@ func (p *Processor) Submit(req *Request) error {
 	case p.queue <- req:
 		return nil
 	case <-p.ctx.Done():
-		return fmt.Errorf("processor shut down")
+		return fmt.Errorf("processor is shutting down")
 	default:
-		return fmt.Errorf("queue full")
+		return fmt.Errorf("queue is full")
 	}
 }
 
@@ -138,7 +164,9 @@ func (p *Processor) GetResults(count int, timeout time.Duration) []*Result {
 	for i := 0; i < count; i++ {
 		select {
 		case result := <-p.results:
-			results = append(results, result)
+			if result != nil {
+				results = append(results, result)
+			}
 		case <-deadline:
 			return results
 		case <-p.ctx.Done():
@@ -149,12 +177,28 @@ func (p *Processor) GetResults(count int, timeout time.Duration) []*Result {
 	return results
 }
 
-// Close shuts down processor
-func (p *Processor) Close() {
-	p.cancel()
-	close(p.queue)
-	p.wg.Wait()
-	close(p.results)
+func (p *Processor) Close() error {
+	var err error
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		p.mu.Unlock()
+
+		p.cancel()
+
+		close(p.queue)
+
+		p.wg.Wait()
+
+		close(p.results)
+	})
+	return err
+}
+
+func (p *Processor) IsClosed() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.closed
 }
 
 func (p *Processor) GetMetrics() map[string]interface{} {
@@ -167,6 +211,9 @@ func (p *Processor) GetMetrics() map[string]interface{} {
 		"failed":       p.metrics.TotalFailed,
 		"avg_duration": p.metrics.AvgDuration.Milliseconds(),
 		"success_rate": p.calculateSuccessRate(),
+		"workers":      p.workers,
+		"queue_size":   len(p.queue),
+		"results_size": len(p.results),
 	}
 }
 
@@ -196,7 +243,7 @@ func (m *Metrics) Update(result *Result) {
 	if m.TotalProcessed == 1 {
 		m.AvgDuration = result.Duration
 	} else {
-		total := m.AvgDuration*time.Duration(m.TotalProcessed-1) + result.Duration
-		m.AvgDuration = total / time.Duration(m.TotalProcessed)
+		alpha := 0.1
+		m.AvgDuration = time.Duration(float64(m.AvgDuration)*(1-alpha) + float64(result.Duration)*alpha)
 	}
 }
