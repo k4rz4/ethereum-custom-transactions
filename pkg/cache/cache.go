@@ -35,7 +35,14 @@ func (pc *ProofCache) Get(txHash common.Hash) (interface{}, bool) {
 		return nil, false
 	}
 
-	cached := val.(*CachedProof)
+	cached, ok := val.(*CachedProof)
+	if !ok {
+		// Invalid type, remove it
+		pc.cache.Delete(txHash.Hex())
+		return nil, false
+	}
+
+	// Check if expired
 	if time.Since(cached.Timestamp) > pc.ttl {
 		pc.cache.Delete(txHash.Hex())
 		return nil, false
@@ -51,13 +58,22 @@ func (pc *ProofCache) Set(txHash common.Hash, proof interface{}) {
 	})
 }
 
+func (pc *ProofCache) Delete(txHash common.Hash) {
+	pc.cache.Delete(txHash.Hex())
+}
+
 func (pc *ProofCache) cleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		pc.cache.Range(func(key, value interface{}) bool {
-			cached := value.(*CachedProof)
+			cached, ok := value.(*CachedProof)
+			if !ok {
+				pc.cache.Delete(key)
+				return true
+			}
+
 			if time.Since(cached.Timestamp) > pc.ttl {
 				pc.cache.Delete(key)
 			}
@@ -71,6 +87,10 @@ type BlockCache struct {
 }
 
 func NewBlockCache(size int) (*BlockCache, error) {
+	if size < 1 {
+		size = 100
+	}
+
 	cache, err := lru.New(size)
 	if err != nil {
 		return nil, err
@@ -83,18 +103,40 @@ func (bc *BlockCache) Get(blockHash common.Hash) (*types.Block, bool) {
 	if !ok {
 		return nil, false
 	}
-	return val.(*types.Block), true
+
+	block, ok := val.(*types.Block)
+	if !ok {
+		// Invalid type, remove it
+		bc.cache.Remove(blockHash.Hex())
+		return nil, false
+	}
+
+	return block, true
 }
 
 func (bc *BlockCache) Set(blockHash common.Hash, block *types.Block) {
 	bc.cache.Add(blockHash.Hex(), block)
 }
 
+func (bc *BlockCache) Delete(blockHash common.Hash) {
+	bc.cache.Remove(blockHash.Hex())
+}
+
+func (bc *BlockCache) Len() int {
+	return bc.cache.Len()
+}
+
 type ReceiptCache struct {
 	cache *lru.Cache
 }
 
+// NewReceiptCache creates a new receipt cache
+// size: Maximum number of receipts to cache
 func NewReceiptCache(size int) (*ReceiptCache, error) {
+	if size < 1 {
+		size = 1000
+	}
+
 	cache, err := lru.New(size)
 	if err != nil {
 		return nil, err
@@ -107,9 +149,25 @@ func (rc *ReceiptCache) Get(txHash common.Hash) (*types.Receipt, bool) {
 	if !ok {
 		return nil, false
 	}
-	return val.(*types.Receipt), true
+
+	receipt, ok := val.(*types.Receipt)
+	if !ok {
+		// Invalid type, remove it
+		rc.cache.Remove(txHash.Hex())
+		return nil, false
+	}
+
+	return receipt, true
 }
 
 func (rc *ReceiptCache) Set(txHash common.Hash, receipt *types.Receipt) {
 	rc.cache.Add(txHash.Hex(), receipt)
+}
+
+func (rc *ReceiptCache) Delete(txHash common.Hash) {
+	rc.cache.Remove(txHash.Hex())
+}
+
+func (rc *ReceiptCache) Len() int {
+	return rc.cache.Len()
 }
