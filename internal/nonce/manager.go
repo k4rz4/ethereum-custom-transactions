@@ -2,13 +2,18 @@ package nonce
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// Manager handles thread-safe nonce tracking
+const (
+	DefaultTimeout = 10 * time.Second
+)
+
 type Manager struct {
 	mu            sync.Mutex
 	pendingNonces map[common.Address]uint64
@@ -22,7 +27,6 @@ func New(client *ethclient.Client) *Manager {
 	}
 }
 
-// GetNext returns next nonce (thread-safe)
 func (m *Manager) GetNext(address common.Address) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -32,9 +36,12 @@ func (m *Manager) GetNext(address common.Address) (uint64, error) {
 		return nonce, nil
 	}
 
-	nonce, err := m.client.PendingNonceAt(context.Background(), address)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+
+	nonce, err := m.client.PendingNonceAt(ctx, address)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("failed to get pending nonce: %w", err)
 	}
 
 	m.pendingNonces[address] = nonce + 1
@@ -45,4 +52,17 @@ func (m *Manager) Reset(address common.Address) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.pendingNonces, address)
+}
+
+func (m *Manager) GetCached(address common.Address) (uint64, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	nonce, exists := m.pendingNonces[address]
+	return nonce, exists
+}
+
+func (m *Manager) ResetAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingNonces = make(map[common.Address]uint64)
 }
