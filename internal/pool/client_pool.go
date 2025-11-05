@@ -7,6 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
+// ClientPool manages a pool of Ethereum clients
 type ClientPool struct {
 	clients []*ethclient.Client
 	mu      sync.RWMutex
