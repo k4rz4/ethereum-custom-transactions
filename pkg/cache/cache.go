@@ -66,7 +66,6 @@ func (pc *ProofCache) cleanup() {
 	}
 }
 
-// BlockCache wraps LRU cache for blocks
 type BlockCache struct {
 	cache *lru.Cache
 }
@@ -91,7 +90,6 @@ func (bc *BlockCache) Set(blockHash common.Hash, block *types.Block) {
 	bc.cache.Add(blockHash.Hex(), block)
 }
 
-// ReceiptCache wraps LRU cache for receipts
 type ReceiptCache struct {
 	cache *lru.Cache
 }
