@@ -18,7 +18,12 @@ import (
 	"github.com/k4rz4/ethereum-custom-transactions/pkg/merkle"
 )
 
-// Proof contains transaction proof data
+const (
+	DefaultGasLimit   = uint64(100_000)
+	BaseFeeMultiplier = 2
+	DefaultTimeout    = 30 * time.Second
+)
+
 type Proof struct {
 	Transaction      *types.Transaction
 	BlockNumber      *big.Int
@@ -29,9 +34,9 @@ type Proof struct {
 	ProofPath        []common.Hash
 }
 
-// Manager handles optimized transaction operations
 type Manager struct {
 	privateKey *ecdsa.PrivateKey
+	address    common.Address
 	chainID    *big.Int
 
 	clientPool   *pool.ClientPool
@@ -40,11 +45,13 @@ type Manager struct {
 	proofCache   *cache.ProofCache
 	blockCache   *cache.BlockCache
 	receiptCache *cache.ReceiptCache
-	treeCache    *sync.Map
+	treeCache    *sync.Map // stores common.Hash -> *merkle.Tree
 
 	metrics *Metrics
+	mu      sync.RWMutex
 }
 
+// Metrics tracks manager performance
 type Metrics struct {
 	TxSent          uint64
 	TxFailed        uint64
@@ -54,28 +61,56 @@ type Metrics struct {
 	mu              sync.RWMutex
 }
 
-// NewManager creates optimized transaction manager
+// NewManager creates an optimized transaction manager
+// rpcURL: Ethereum node RPC endpoint (e.g., "http://localhost:8545")
+// privateKeyHex: Private key in hex format (without 0x prefix)
+// poolSize: Number of client connections to pool (recommended: 5-10)
 func NewManager(rpcURL string, privateKeyHex string, poolSize int) (*Manager, error) {
+	if poolSize < 1 {
+		poolSize = 5
+	}
+
 	privateKey, err := crypto.HexToECDSA(privateKeyHex)
 	if err != nil {
 		return nil, fmt.Errorf("invalid private key: %w", err)
 	}
 
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("failed to cast public key to ECDSA")
+	}
+	address := crypto.PubkeyToAddress(*publicKeyECDSA)
+
 	clientPool, err := pool.New(rpcURL, poolSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create pool: %w", err)
+		return nil, fmt.Errorf("failed to create client pool: %w", err)
 	}
 
-	chainID, err := clientPool.Get().ChainID(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	chainID, err := clientPool.Get().ChainID(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get chainID: %w", err)
+		clientPool.Close()
+		return nil, fmt.Errorf("failed to get chain ID: %w", err)
 	}
 
-	blockCache, _ := cache.NewBlockCache(100)
-	receiptCache, _ := cache.NewReceiptCache(1000)
+	blockCache, err := cache.NewBlockCache(100)
+	if err != nil {
+		clientPool.Close()
+		return nil, fmt.Errorf("failed to create block cache: %w", err)
+	}
+
+	receiptCache, err := cache.NewReceiptCache(1000)
+	if err != nil {
+		clientPool.Close()
+		return nil, fmt.Errorf("failed to create receipt cache: %w", err)
+	}
 
 	return &Manager{
 		privateKey:   privateKey,
+		address:      address,
 		chainID:      chainID,
 		clientPool:   clientPool,
 		nonceManager: nonce.New(clientPool.Get()),
@@ -87,85 +122,140 @@ func NewManager(rpcURL string, privateKeyHex string, poolSize int) (*Manager, er
 	}, nil
 }
 
-// Send creates and sends custom transaction
-func (m *Manager) Send(to common.Address, value *big.Int, customData, data []byte) (*types.Transaction, error) {
-	publicKey := m.privateKey.Public()
-	publicKeyECDSA := publicKey.(*ecdsa.PublicKey)
-	fromAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
+func (m *Manager) Send(
+	to common.Address,
+	value *big.Int,
+	customData, data []byte,
+) (*types.Transaction, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+	return m.SendWithContext(ctx, to, value, customData, data)
+}
 
-	nonce, err := m.nonceManager.GetNext(fromAddress)
+func (m *Manager) SendWithContext(
+	ctx context.Context,
+	to common.Address,
+	value *big.Int,
+	customData, data []byte,
+) (*types.Transaction, error) {
+	if value == nil {
+		value = big.NewInt(0)
+	}
+
+	nonce, err := m.nonceManager.GetNext(m.address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get nonce: %w", err)
 	}
 
 	client := m.clientPool.Get()
-	gasLimit := uint64(100000)
-	gasTipCap, err := client.SuggestGasTipCap(context.Background())
+
+	gasTipCap, err := client.SuggestGasTipCap(ctx)
 	if err != nil {
-		m.nonceManager.Reset(fromAddress)
-		return nil, err
+		m.nonceManager.Reset(m.address)
+		return nil, fmt.Errorf("failed to get gas tip: %w", err)
 	}
 
-	head, err := client.HeaderByNumber(context.Background(), nil)
+	head, err := client.HeaderByNumber(ctx, nil)
 	if err != nil {
-		m.nonceManager.Reset(fromAddress)
-		return nil, err
+		m.nonceManager.Reset(m.address)
+		return nil, fmt.Errorf("failed to get block header: %w", err)
 	}
 
-	gasFeeCap := new(big.Int).Add(gasTipCap, new(big.Int).Mul(head.BaseFee, big.NewInt(2)))
+	if head.BaseFee == nil {
+		m.nonceManager.Reset(m.address)
+		return nil, fmt.Errorf("base fee is nil, chain may not support EIP-1559")
+	}
 
-	tx := NewCustomTransaction(m.chainID, nonce, &to, value, gasLimit, gasTipCap, gasFeeCap, data, customData)
+	gasFeeCap := new(big.Int).Add(
+		gasTipCap,
+		new(big.Int).Mul(head.BaseFee, big.NewInt(BaseFeeMultiplier)),
+	)
+
+	// Create custom transaction
+	tx := NewCustomTransaction(
+		m.chainID,
+		nonce,
+		&to,
+		value,
+		DefaultGasLimit,
+		gasTipCap,
+		gasFeeCap,
+		data,
+		customData,
+	)
 
 	signedTx, err := types.SignTx(tx, types.NewLondonSigner(m.chainID), m.privateKey)
 	if err != nil {
-		m.nonceManager.Reset(fromAddress)
-		return nil, err
+		m.nonceManager.Reset(m.address)
+		return nil, fmt.Errorf("failed to sign transaction: %w", err)
 	}
 
-	err = client.SendTransaction(context.Background(), signedTx)
+	// Send transaction
+	err = client.SendTransaction(ctx, signedTx)
 	if err != nil {
-		m.nonceManager.Reset(fromAddress)
+		m.nonceManager.Reset(m.address)
 		m.metrics.IncrementTxFailed()
-		return nil, err
+		return nil, fmt.Errorf("failed to send transaction: %w", err)
 	}
 
 	m.metrics.IncrementTxSent()
 	return signedTx, nil
 }
 
-// GenerateProof generates optimized proof
 func (m *Manager) GenerateProof(txHash common.Hash) (*Proof, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+	return m.GenerateProofWithContext(ctx, txHash)
+}
+
+func (m *Manager) GenerateProofWithContext(
+	ctx context.Context,
+	txHash common.Hash,
+) (*Proof, error) {
+	// Check cache first
 	if cached, exists := m.proofCache.Get(txHash); exists {
 		m.metrics.IncrementCacheHits()
-		return cached.(*Proof), nil
+		proof, ok := cached.(*Proof)
+		if !ok {
+			return nil, fmt.Errorf("invalid cached proof type")
+		}
+		return proof, nil
 	}
 
 	m.metrics.IncrementCacheMisses()
 
-	var receipt *types.Receipt
-	if cached, ok := m.receiptCache.Get(txHash); ok {
-		receipt = cached
-	} else {
-		var err error
-		receipt, err = m.clientPool.Get().TransactionReceipt(context.Background(), txHash)
-		if err != nil {
-			return nil, err
-		}
-		m.receiptCache.Set(txHash, receipt)
-	}
-
-	tx, isPending, err := m.clientPool.Get().TransactionByHash(context.Background(), txHash)
-	if err != nil || isPending {
-		return nil, fmt.Errorf("transaction not found or pending")
-	}
-
-	tree, err := m.getMerkleTree(receipt.BlockHash)
+	// Get receipt
+	receipt, err := m.getReceipt(ctx, txHash)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get receipt: %w", err)
 	}
 
+	// Get transaction
+	tx, isPending, err := m.clientPool.Get().TransactionByHash(ctx, txHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction: %w", err)
+	}
+	if isPending {
+		return nil, fmt.Errorf("transaction is still pending")
+	}
+
+	// Get Merkle tree for this block
+	tree, err := m.getMerkleTree(ctx, receipt.BlockHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get merkle tree: %w", err)
+	}
+
+	// Generate proof path
 	proofPath := tree.GenerateProof(receipt.TransactionIndex)
-	customData, _ := GetCustomData(tx)
+	if proofPath == nil {
+		return nil, fmt.Errorf("failed to generate proof path")
+	}
+
+	// Extract custom data
+	customData, err := GetCustomData(tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract custom data: %w", err)
+	}
 
 	proof := &Proof{
 		Transaction:      tx,
@@ -183,67 +273,127 @@ func (m *Manager) GenerateProof(txHash common.Hash) (*Proof, error) {
 	return proof, nil
 }
 
-// VerifyProof verifies transaction proof
 func (m *Manager) VerifyProof(proof *Proof) (bool, error) {
-	var block *types.Block
-	if cached, ok := m.blockCache.Get(proof.BlockHash); ok {
-		block = cached
-	} else {
-		var err error
-		block, err = m.clientPool.Get().BlockByHash(context.Background(), proof.BlockHash)
-		if err != nil {
-			return false, err
-		}
-		m.blockCache.Set(proof.BlockHash, block)
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+	return m.VerifyProofWithContext(ctx, proof)
+}
+
+func (m *Manager) VerifyProofWithContext(ctx context.Context, proof *Proof) (bool, error) {
+	if proof == nil {
+		return false, fmt.Errorf("proof is nil")
+	}
+
+	block, err := m.getBlock(ctx, proof.BlockHash)
+	if err != nil {
+		return false, fmt.Errorf("failed to get block: %w", err)
 	}
 
 	if proof.TransactionIndex >= uint(len(block.Transactions())) {
-		return false, fmt.Errorf("index out of range")
+		return false, fmt.Errorf("transaction index %d out of range (block has %d transactions)",
+			proof.TransactionIndex, len(block.Transactions()))
 	}
 
 	tx := block.Transactions()[proof.TransactionIndex]
 	if tx.Hash() != proof.Transaction.Hash() {
-		return false, fmt.Errorf("hash mismatch")
+		return false, fmt.Errorf("transaction hash mismatch")
 	}
 
-	tree, err := m.getMerkleTree(proof.BlockHash)
+	if proof.Receipt.TxHash != proof.Transaction.Hash() {
+		return false, fmt.Errorf("receipt transaction hash mismatch")
+	}
+
+	tree, err := m.getMerkleTree(ctx, proof.BlockHash)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to get merkle tree: %w", err)
 	}
 
-	return tree.VerifyProof(proof.Transaction.Hash(), proof.TransactionIndex, proof.ProofPath), nil
-}
-
-func (m *Manager) getMerkleTree(blockHash common.Hash) (*merkle.Tree, error) {
-	if cached, ok := m.treeCache.Load(blockHash.Hex()); ok {
-		return cached.(*merkle.Tree), nil
+	isValid := tree.VerifyProof(proof.Transaction.Hash(), proof.TransactionIndex, proof.ProofPath)
+	if !isValid {
+		return false, fmt.Errorf("merkle proof verification failed")
 	}
 
-	var block *types.Block
-	if cached, ok := m.blockCache.Get(blockHash); ok {
-		block = cached
-	} else {
-		var err error
-		block, err = m.clientPool.Get().BlockByHash(context.Background(), blockHash)
-		if err != nil {
-			return nil, err
+	extractedData, err := GetCustomData(proof.Transaction)
+	if err != nil {
+		return false, fmt.Errorf("failed to extract custom data: %w", err)
+	}
+
+	if len(extractedData) != len(proof.CustomData) {
+		return false, fmt.Errorf("custom data length mismatch")
+	}
+
+	for i := range extractedData {
+		if extractedData[i] != proof.CustomData[i] {
+			return false, fmt.Errorf("custom data mismatch at byte %d", i)
 		}
-		m.blockCache.Set(blockHash, block)
 	}
 
-	tree := merkle.NewTree(block.Transactions())
-	m.treeCache.Store(blockHash.Hex(), tree)
-
-	return tree, nil
+	return true, nil
 }
 
-// GetMetrics returns performance metrics
-func (m *Manager) GetMetrics() map[string]uint64 {
+func (m *Manager) Address() common.Address {
+	return m.address
+}
+
+func (m *Manager) ChainID() *big.Int {
+	return new(big.Int).Set(m.chainID)
+}
+
+func (m *Manager) Metrics() map[string]uint64 {
 	return m.metrics.GetStats()
 }
 
-func (m *Manager) Close() {
-	m.clientPool.Close()
+func (m *Manager) Close() error {
+	return m.clientPool.Close()
+}
+
+func (m *Manager) getReceipt(ctx context.Context, txHash common.Hash) (*types.Receipt, error) {
+	// Check cache
+	if cached, ok := m.receiptCache.Get(txHash); ok {
+		return cached, nil
+	}
+
+	receipt, err := m.clientPool.Get().TransactionReceipt(ctx, txHash)
+	if err != nil {
+		return nil, err
+	}
+
+	m.receiptCache.Set(txHash, receipt)
+	return receipt, nil
+}
+
+func (m *Manager) getBlock(ctx context.Context, blockHash common.Hash) (*types.Block, error) {
+	if cached, ok := m.blockCache.Get(blockHash); ok {
+		return cached, nil
+	}
+
+	block, err := m.clientPool.Get().BlockByHash(ctx, blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	m.blockCache.Set(blockHash, block)
+	return block, nil
+}
+
+func (m *Manager) getMerkleTree(ctx context.Context, blockHash common.Hash) (*merkle.Tree, error) {
+	if cached, ok := m.treeCache.Load(blockHash); ok {
+		tree, ok := cached.(*merkle.Tree)
+		if !ok {
+			return nil, fmt.Errorf("invalid cached tree type")
+		}
+		return tree, nil
+	}
+
+	block, err := m.getBlock(ctx, blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	tree := merkle.NewTree(block.Transactions())
+	m.treeCache.Store(blockHash, tree)
+
+	return tree, nil
 }
 
 func (m *Metrics) IncrementTxSent() {
@@ -281,10 +431,10 @@ func (m *Metrics) GetStats() map[string]uint64 {
 	defer m.mu.RUnlock()
 
 	return map[string]uint64{
-		"tx_sent":           m.TxSent,
-		"tx_failed":         m.TxFailed,
-		"proofs_generated":  m.ProofsGenerated,
-		"cache_hits":        m.CacheHits,
-		"cache_misses":      m.CacheMisses,
+		"tx_sent":          m.TxSent,
+		"tx_failed":        m.TxFailed,
+		"proofs_generated": m.ProofsGenerated,
+		"cache_hits":       m.CacheHits,
+		"cache_misses":     m.CacheMisses,
 	}
 }
