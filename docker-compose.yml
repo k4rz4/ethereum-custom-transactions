@@ -1,0 +1,92 @@
+version: '3.8'
+
+services:
+  # Ethereum local node (Ganache)
+  ganache:
+    image: trufflesuite/ganache:latest
+    container_name: ethereum-ganache
+    ports:
+      - "8545:8545"
+    command:
+      - --wallet.mnemonic
+      - "test test test test test test test test test test test junk"
+      - --chain.chainId
+      - "1337"
+      - --wallet.totalAccounts
+      - "10"
+      - --server.host
+      - "0.0.0.0"
+    networks:
+      - ethereum-network
+
+  # Service 1: Basic Example
+  basic-example:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth-basic-example
+    depends_on:
+      - ganache
+    environment:
+      - ETH_RPC_URL=http://ganache:8545
+      - CHAIN_ID=1337
+    networks:
+      - ethereum-network
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo '=== Starting Basic Example ==='
+        sleep 5
+        /root/bin/basic
+        echo '=== Basic Example Completed ==='
+        tail -f /dev/null
+    restart: unless-stopped
+
+  # Service 2: Manager Example (with single transaction)
+  manager-example:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth-manager-example
+    depends_on:
+      - ganache
+    environment:
+      - ETH_RPC_URL=http://ganache:8545
+      - CHAIN_ID=1337
+      - PRIVATE_KEY=ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+    networks:
+      - ethereum-network
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo '=== Starting Manager Example ==='
+        sleep 10
+        /root/bin/manager
+        echo '=== Manager Example Completed ==='
+        tail -f /dev/null
+    restart: unless-stopped
+
+  # Service 3: Batch Processing Example
+  batch-example:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: eth-batch-example
+    depends_on:
+      - ganache
+    environment:
+      - ETH_RPC_URL=http://ganache:8545
+      - CHAIN_ID=1337
+      - PRIVATE_KEY=ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
+      - BATCH_SIZE=100
+      - WORKERS=20
+    networks:
+      - ethereum-network
+    command: sh -c "echo '=== Starting Batch Processing Example ===' && sleep 10 && /root/bin/batch && echo '=== Batch Processing Completed ===' && tail -f /dev/null"
+    restart: unless-stopped
+
+networks:
+  ethereum-network:
+    driver: bridge
